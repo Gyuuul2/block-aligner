@@ -95,6 +95,19 @@ struct State3di<'a, M: Matrix> {
     x_drop: i32
 }
 
+struct StateAA<'a, M: Matrix> {
+    query: PaddedBytesAA<'a>,
+    i: usize,
+    reference: PaddedBytesAA<'a>,
+    j: usize,
+    min_size: usize,
+    max_size: usize,
+    matrix: &'a M,
+    gaps: Gaps,
+    x_drop: i32
+}
+
+
 /// Data structure storing the settings for block aligner.
 pub struct Block<const TRACE: bool, const X_DROP: bool> {
     res: AlignResult,
@@ -662,13 +675,15 @@ macro_rules! place_block_profile_gen {
                         D11 = simd_insert_i16!(D11, ZERO, 0);
                     }
 
-                    let C11_open = simd_adds_i16(D10, simd_adds_i16(gap_open_C, gap_extend));
+                    // let C11_open = simd_adds_i16(D10, simd_adds_i16(gap_open_C, gap_extend));
+                    let C11_open = simd_adds_i16(D10, gap_open_C);
                     let C11 = simd_max_i16(simd_adds_i16(C10, gap_extend), C11_open);
                     let C11_end = if $right { simd_adds_i16(C11, gap_close_C) } else { C11 };
                     D11 = simd_max_i16(D11, C11_end);
                     // at this point, C11 is fully calculated and D11 is partially calculated
 
-                    let D11_open = simd_adds_i16(D11, gap_open_R);
+                    // let D11_open = simd_adds_i16(D11, gap_open_R);
+                    let D11_open = simd_adds_i16(D11, simd_subs_i16(gap_open_R, gap_extend)); 
                     R11 = simd_prefix_scan_i16(D11_open, gap_extend, prefix_scan_consts);
                     // do prefix scan before using R01 to break up dependency chain that depends on
                     // the last element of R01 from the previous loop iteration
@@ -952,9 +967,48 @@ impl<const TRACE: bool, const X_DROP: bool> Block<{ TRACE }, { X_DROP }> {
         unsafe { self.align_3di_core(s); }
     }
 
+    pub fn align_aa(&mut self, query: &PaddedBytes, query_bias: &PosBias, reference: &PaddedBytes, reference_bias: &PosBias, matrix: &AAMatrix, gaps: Gaps, size: RangeInclusive<usize>, x_drop: i32) {
+        // check invariants so bad stuff doesn't happen later
+        assert_eq!(query.len(), query_bias.len());
+        assert_eq!(reference.len(), reference_bias.len());
+        assert!(gaps.open < 0 && gaps.extend < 0, "Gap costs must be negative!");
+        // there are edge cases with calculating traceback that doesn't work if
+        // gap open does not cost more than gap extend
+        assert!(gaps.open < gaps.extend, "Gap open must cost more than gap extend!");
+        let min_size = if *size.start() < L { L } else { *size.start() };
+        let max_size = if *size.end() < L { L } else { *size.end() };
+        assert!(min_size < (u16::MAX as usize) && max_size < (u16::MAX as usize), "Block sizes must be smaller than 2^16 - 1!");
+        assert!(min_size.is_power_of_two() && max_size.is_power_of_two(), "Block sizes must be powers of two!");
+        if X_DROP {
+            assert!(x_drop >= 0, "X-drop threshold amount must be nonnegative!");
+        }
+
+        unsafe { self.allocated.clear(query.len(), reference.len(), max_size, TRACE); }
+
+        let s = StateAA {
+            query: PaddedBytesAA {
+                bytes: query,
+                pos_bias: query_bias
+            },
+            i: 0,
+            reference: PaddedBytesAA {
+                bytes: reference,
+                pos_bias: reference_bias
+            },
+            j: 0,
+            min_size,
+            max_size,
+            matrix,
+            gaps,
+            x_drop
+        };
+        unsafe { self.align_aa_core(s); }
+    }
+
     align_core_gen!(align_core, Matrix, State, Self::place_block, Self::place_block);
     align_core_gen!(align_profile_core, Profile, StateProfile, Self::place_block_profile_right, Self::place_block_profile_down);
     align_core_gen!(align_3di_core, Matrix, State3di, Self::place_block_3di, Self::place_block_3di);
+    align_core_gen!(align_aa_core, Matrix, StateAA, Self::place_block_aa, Self::place_block_aa);
 
     #[cfg_attr(feature = "simd_sse2", target_feature(enable = "sse2"))]
     #[cfg_attr(feature = "simd_avx2", target_feature(enable = "avx2"))]
@@ -1076,7 +1130,7 @@ impl<const TRACE: bool, const X_DROP: bool> Block<{ TRACE }, { X_DROP }> {
 
             let c = reference.get(start_j + j);
 
-            let mut i = 0;
+            let mut i = 0; 
             while i < height {
                 #[cfg(all(any(target_arch = "x86", target_arch = "x86_64"), feature = "mca"))]
                 asm!("# LLVM-MCA-BEGIN place_block inner loop", options(nomem, nostack, preserves_flags));
@@ -1274,6 +1328,178 @@ impl<const TRACE: bool, const X_DROP: bool> Block<{ TRACE }, { X_DROP }> {
                     simd_dbg_i16(scores);
                     print!("3di: ");
                     simd_dbg_i16(scores_3di);
+                    print!("D00: ");
+                    simd_dbg_i16(simd_subs_i16(D00, simd_set1_i16(ZERO)));
+                    print!("C11: ");
+                    simd_dbg_i16(simd_subs_i16(C11, simd_set1_i16(ZERO)));
+                    print!("R11: ");
+                    simd_dbg_i16(simd_subs_i16(R11, simd_set1_i16(ZERO)));
+                    print!("D11: ");
+                    simd_dbg_i16(simd_subs_i16(D11, simd_set1_i16(ZERO)));
+                }
+
+                if TRACE {
+                    let trace_D_C = simd_cmpeq_i16(D11, C11);
+                    let trace_D_R = simd_cmpeq_i16(D11, R11);
+                    #[cfg(feature = "debug")]
+                    {
+                        print!("D_C: ");
+                        simd_dbg_i16(trace_D_C);
+                        print!("D_R: ");
+                        simd_dbg_i16(trace_D_R);
+                    }
+                    // compress trace with movemask to save space
+                    let mask = simd_set1_i16(0xFF00u16 as i16);
+                    let trace_data = simd_movemask_i8(simd_blend_i8(trace_D_C, trace_D_R, mask));
+                    let temp_trace_R = simd_cmpeq_i16(R11, D11_open);
+                    let trace_R = simd_sl_i16!(temp_trace_R, prev_trace_R, 1);
+                    let trace_data2 = simd_movemask_i8(simd_blend_i8(simd_cmpeq_i16(C11, C11_open), trace_R, mask));
+                    prev_trace_R = temp_trace_R;
+                    trace.add_trace(trace_data as TraceType, trace_data2 as TraceType);
+                }
+
+                D_max = simd_max_i16(D_max, D11);
+
+                if X_DROP {
+                    // keep track of the best score and its location
+                    let mask = simd_cmpeq_i16(D_max, D11);
+                    D_argmax_i = simd_blend_i8(D_argmax_i, simd_set1_i16(i as i16), mask);
+                    D_argmax_j = simd_blend_i8(D_argmax_j, simd_set1_i16(j as i16), mask);
+                }
+
+                simd_store(D_col.add(i) as _, D11);
+                simd_store(C_col.add(i) as _, C11);
+                i += L;
+
+                #[cfg(all(any(target_arch = "x86", target_arch = "x86_64"), feature = "mca"))]
+                asm!("# LLVM-MCA-END", options(nomem, nostack, preserves_flags));
+            }
+
+            D_corner = simd_set1_i16(MIN);
+
+            ptr::write(D_row.add(j), simd_extract_i16!(D11, L - 1));
+            ptr::write(R_row.add(j), simd_extract_i16!(R11, L - 1));
+
+            if !X_DROP && start_i + height > query.len()
+                && start_j + j >= reference.len() {
+                if TRACE {
+                    // make sure that the trace index is updated since the rest of the loop
+                    // iterations are skipped
+                    trace.add_trace_idx((width - 1 - j) * (height / L));
+                }
+                break;
+            }
+        }
+
+        (D_max, D_argmax_i, D_argmax_j)
+    }
+
+
+    #[cfg_attr(feature = "simd_sse2", target_feature(enable = "sse2"))]
+    #[cfg_attr(feature = "simd_avx2", target_feature(enable = "avx2"))]
+    #[cfg_attr(feature = "simd_wasm", target_feature(enable = "simd128"))]
+    #[cfg_attr(feature = "simd_neon", target_feature(enable = "neon"))]
+    #[allow(non_snake_case)]
+    unsafe fn place_block_aa<M: Matrix>(state: &StateAA<M>,
+                                         query: PaddedBytesAA,
+                                         reference: PaddedBytesAA,
+                                         trace: &mut Trace,
+                                         start_i: usize,
+                                         start_j: usize,
+                                         width: usize,
+                                         height: usize,
+                                         D_col: *mut i16,
+                                         C_col: *mut i16,
+                                         D_row: *mut i16,
+                                         R_row: *mut i16,
+                                         mut D_corner: Simd,
+                                         right: bool) -> (Simd, Simd, Simd) {
+        let gap_open = simd_set1_i16(state.gaps.open as i16);
+        let gap_extend = simd_set1_i16(state.gaps.extend as i16);
+        let (gap_extend_all, prefix_scan_consts) = get_prefix_scan_consts(gap_extend);
+        let mut D_max = simd_set1_i16(MIN);
+        let mut D_argmax_i = simd_set1_i16(0);
+        let mut D_argmax_j = simd_set1_i16(0);
+
+        if width == 0 || height == 0 {
+            return (D_max, D_argmax_i, D_argmax_j);
+        }
+
+        // hottest loop in the whole program
+        for j in 0..width {
+            let mut R01 = simd_set1_i16(MIN);
+            let mut D11 = simd_set1_i16(MIN);
+            let mut R11 = simd_set1_i16(MIN);
+            let mut prev_trace_R = simd_set1_i16(0);
+
+            let c = reference.bytes.get(start_j + j);
+            let reference_bias = simd_set1_i16(reference.pos_bias.get(start_j + j));
+
+            let mut i = 0;
+            while i < height {
+                #[cfg(all(any(target_arch = "x86", target_arch = "x86_64"), feature = "mca"))]
+                asm!("# LLVM-MCA-BEGIN place_block inner loop", options(nomem, nostack, preserves_flags));
+
+                let D10 = simd_load(D_col.add(i) as _);
+                let C10 = simd_load(C_col.add(i) as _);
+                let D00 = simd_sl_i16!(D10, D_corner, 1);
+                D_corner = D10;
+
+                let scores = state.matrix.get_scores(c, halfsimd_loadu(query.bytes.as_ptr(start_i + i) as _), right);
+                let query_bias = query.pos_bias.get_biases(start_i + i);
+                let pos_bias = simd_adds_i16(reference_bias, query_bias);
+                D11 = simd_adds_i16(D00, simd_adds_i16(scores, pos_bias));
+                if start_i + i == 0 && start_j + j == 0 {
+                    D11 = simd_insert_i16!(D11, ZERO, 0);
+                }
+
+                let C11_open = simd_adds_i16(D10, gap_open);
+                let C11 = simd_max_i16(simd_adds_i16(C10, gap_extend), C11_open);
+                D11 = simd_max_i16(D11, C11);
+                // at this point, C11 is fully calculated and D11 is partially calculated
+                
+                let D11_open = simd_adds_i16(D11, simd_subs_i16(gap_open, gap_extend));
+                #[cfg(feature = "debug")]
+                {
+                    print!(" g-seqD11:   ");
+                    // simd_dbg_i16(simd_subs_i16(D11_open, simd_set1_i16(ZERO)));
+                    simd_dbg_i16(D11);
+                    print!(" g-simd_subs_i16(gap_open, gap_extend):   ");
+                    simd_dbg_i16(simd_subs_i16(gap_open, gap_extend));
+                    print!(" g-seqD11_open:   ");
+                    // simd_dbg_i16(simd_subs_i16(D11_open, simd_set1_i16(ZERO)));
+                    simd_dbg_i16(D11_open);
+                    print!(" g-gapExtend: ");
+                    // simd_dbg_i16(simd_subs_i16(gap_extend, simd_set1_i16(ZERO)));
+                    simd_dbg_i16(gap_extend);
+                    print!(" g-prefix_scan_consts: ");
+                    // simd_dbg_i16(simd_subs_i16(prefix_scan_consts, simd_set1_i16(ZERO)));
+                    simd_dbg_i16(prefix_scan_consts);
+                }
+                R11 = simd_prefix_scan_i16(D11_open, gap_extend, prefix_scan_consts);
+                // do prefix scan before using R01 to break up dependency chain that depends on
+                // the last element of R01 from the previous loop iteration
+                #[cfg(feature = "debug")]
+                {
+                    print!(" g-R11tmp:   ");
+                    simd_dbg_i16(R11);
+                }
+                R11 = simd_max_i16(R11, simd_adds_i16(simd_broadcasthi_i16(R01), gap_extend_all));
+                // fully calculate D11 using R11
+                #[cfg(feature = "debug")]
+                {
+                    print!(" g-R11tmp2:   ");
+                    simd_dbg_i16(R11);
+                    print!("g-2D11: ");
+                    simd_dbg_i16(simd_subs_i16(D11, simd_set1_i16(ZERO)));
+                }
+                D11 = simd_max_i16(D11, R11);
+                R01 = R11;
+
+                #[cfg(feature = "debug")]
+                {
+                    print!("s:   ");
+                    simd_dbg_i16(scores);
                     print!("D00: ");
                     simd_dbg_i16(simd_subs_i16(D00, simd_set1_i16(ZERO)));
                     print!("C11: ");
@@ -1857,6 +2083,18 @@ impl<'a> PaddedBytes3di<'a> {
     }
 }
 
+#[derive(Copy, Clone, Debug)]
+struct PaddedBytesAA<'a> {
+    pub bytes: &'a PaddedBytes,
+    pub pos_bias: &'a PosBias
+}
+
+impl<'a> PaddedBytesAA<'a> {
+    pub fn len(&self) -> usize {
+        self.bytes.len()
+    }
+}
+
 /// A padded string that helps avoid out of bounds access when using SIMD.
 ///
 /// A single padding byte in inserted before the start of the string,
@@ -1882,6 +2120,15 @@ impl PaddedBytes {
         self.s[0] = M::convert_char(M::NULL);
         self.s[1..1 + b.len()].copy_from_slice(b);
         self.s[1..1 + b.len()].iter_mut().for_each(|c| *c = M::convert_char(*c));
+        self.s[1 + b.len()..1 + b.len() + block_size].fill(M::convert_char(M::NULL));
+        self.len = b.len();
+    }
+
+    /// Modifies the bytes in place, filling in the rest of the memory with padding bytes.
+    pub fn set_bytes_num<M: Matrix>(&mut self, b: &[u8], block_size: usize) {
+        self.s[0] = M::convert_char(M::NULL);
+        self.s[1..1 + b.len()].copy_from_slice(b);
+        // self.s[1..1 + b.len()].iter_mut().for_each(|c| *c = M::convert_char(*c));
         self.s[1 + b.len()..1 + b.len() + block_size].fill(M::convert_char(M::NULL));
         self.len = b.len();
     }
