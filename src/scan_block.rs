@@ -12,6 +12,9 @@ use crate::simd128::*;
 #[cfg(feature = "simd_neon")]
 use crate::neon::*;
 
+#[cfg(feature = "no_simd")]
+use crate::fallback::*;
+
 use crate::scores::*;
 use crate::cigar::*;
 
